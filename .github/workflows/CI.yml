@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compare_versions.outputs.version }}
+    steps:
+      - name: Compare versions
+        id: compare_versions
+        run: |
+          baseVersion=$(curl -s https://raw.githubusercontent.com/github/gh-gei/main/LATEST-VERSION.txt)
+          currentVersion=$(curl -s https://raw.githubusercontent.com/gh-migration-tools/Octoshift/main/LATEST-VERSION.txt)
+
+          echo $baseVersion
+          echo $currentVersion
+        
+          if [ "$baseVersion" != "$currentVersion" ]; then
+            echo "version=$baseVersion" >> $GITHUB_OUTPUT
+            echo $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check-version
+    runs-on: ubuntu-latest
+    if: needs.check-version.outputs.version != ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Update repository
+        run: |
+          # Checkout the gh-gei repository
+          git clone https://github.com/github/gh-gei.git /home/runner/work/gh-gei
+
+          # Delete folder recursively
+          rm -rf /home/runner/work/Octoshift/Octoshift/src/Octoshift
+
+          # Copy folder from gh-gei
+          cp -r /home/runner/work/gh-gei/src/Octoshift /home/runner/work/Octoshift/Octoshift/src/
+
+          # Set LATEST-VERSION
+          echo ${{ needs.check-version.outputs.version }} > LATEST-VERSION.txt
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Restore dependencies
+        run: dotnet restore src/OctoshiftCLI.sln
+
+      - name: Build solution
+        shell: bash
+        run: dotnet build src/OctoshiftCLI.sln --configuration Release --no-restore
+
+      - name: Pack Octoshift NuGet package
+        run: |
+          versionStr=${{ needs.check-version.outputs.version }}
+          version="${versionStr#v}"
+
+          dotnet pack src/Octoshift/Octoshift.csproj \
+            --configuration Release \
+            --no-build \
+            --no-restore \
+            --output ./nupkg \
+            /p:PackageVersion=$version \
+            /p:NoWarn=NU5104 \
+            /p:Authors=GitHub \
+            /p:Product=Octoshift \
+            /p:Description="Core library for a GitHub Migration CLI" \
+            /p:PackageId=Octoshift \
+            /p:PackageLicenseExpression=MIT \
+            /p:Copyright="Copyright (c) 2021 GitHub" \
+            /p:PackageProjectUrl="https://github.com/gh-migration-tools/Octoshift" \
+            /p:RepositoryUrl="https://github.com/gh-migration-tools/Octoshift" \
+            /p:PublishRepositoryUrl=true \
+            /p:IncludeSymbols=true \
+            /p:SymbolPackageFormat=snupkg
+
+      - name: Publish NuGet packages to GitHub Packages
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ github.repository_owner }}"
+
+          dotnet nuget push ./nupkg/*.nupkg \
+            --source "https://nuget.pkg.github.com/$OWNER/index.json" \
+            --api-key "$NUGET_AUTH_TOKEN"
+
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: Update to version ${{ needs.check-version.outputs.version }}
+          branch: main
